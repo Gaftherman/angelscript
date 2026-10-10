@@ -229,7 +229,8 @@ protected:
 	int                RegisterEnum(asCScriptNode *node, asCScriptCode *file, asSNameSpace *ns);
 	int                RegisterTypedef(asCScriptNode *node, asCScriptCode *file, asSNameSpace *ns);
 	int                RegisterFuncDef(asCScriptNode *node, asCScriptCode *file, asSNameSpace *ns, asCObjectType *parent);
-	asCScriptFunction *RegisterLambda(asCScriptNode *node, asCScriptCode *file, asCScriptFunction *funcDef, const asCString &name, asSNameSpace *ns, bool isShared);
+	asCScriptFunction *RegisterLambda(asCScriptNode *node, asCScriptCode *file, asCScriptFunction *funcDef, const asCString &name, asSNameSpace *ns, bool isShared, asCObjectType *closureType = 0, asCArray<asCString> *outerVars = 0, bool outerHasThis = false);
+	asCObjectType     *SynthesizeClosureClass(const asCString &name, asSNameSpace *ns, bool isShared, asCScriptCode *file);
 	void               CompleteFuncDef(sFuncDef *funcDef);
 	void               CompileInterfaces();
 	void               CompileClasses(asUINT originalNumTempl);
@@ -249,7 +250,7 @@ protected:
 	int                GetEnumValueFromType(asCEnumType *type, const char *name, asCDataType &outDt, asINT64 &outValue);
 	int                GetEnumValue(const char *name, asCDataType &outDt, asINT64 &outValue, asSNameSpace *ns);
 	bool               DoesTypeExist(const asCString &type);
-	asCObjectProperty *GetObjectProperty(asCDataType &obj, const char *prop);
+	asCObjectProperty *GetObjectProperty(const asCDataType &obj, const char *prop);
 	asCScriptFunction *GetFunctionDescription(int funcId);
 	void               GetFunctionDescriptions(const char *name, asCArray<int> &funcs, asSNameSpace *ns);
 	void               GetObjectMethodDescriptions(const char *name, asCObjectType *objectType, asCArray<int> &methods, bool objIsConst, const asCString &scope = "", asCScriptNode *errNode = 0, asCScriptCode *script = 0);

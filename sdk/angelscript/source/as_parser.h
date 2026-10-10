@@ -141,6 +141,8 @@ protected:
 	bool IsLambda();
 	bool IsFunctionCall(bool isTemplate);
 	bool IsTemplateTypeList(sToken startFrom, sToken *after = 0);
+	bool IsFunctionType(sToken startFrom, sToken *after = 0);
+	asCScriptNode *ParseFunctionType(asCScriptNode *node);
 
 	// Expressions
 	asCScriptNode *ParseAssignment();

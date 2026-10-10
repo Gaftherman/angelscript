@@ -521,12 +521,17 @@ asCScriptNode *asCParser::ParseType(bool allowConst, bool allowVariableType, boo
 	node->AddChildLast(ParseDataType(allowVariableType, allowAuto));
 	if( isSyntaxError ) return node;
 
-	// If the datatype is a template type, then parse the subtype within the < >
+	// If the datatype is a template type or canonical function type, then parse the subtype within the < >
 	GetToken(&t);
 	RewindTo(&t);
 	asCScriptNode *type = node->lastChild;
 	tempString.Assign(&script->code[type->tokenPos], type->tokenLength);
-	if( engine->IsTemplateType(tempString.AddressOf()) && t.type == ttLessThan )
+	if( tempString == FUNCTION_TOKEN && t.type == ttLessThan )
+	{
+		ParseFunctionType(node);
+		if (isSyntaxError) return node;
+	}
+	else if( engine->IsTemplateType(tempString.AddressOf()) && t.type == ttLessThan )
 	{
 		ParseTemplTypeList(node);
 		if (isSyntaxError) return node;
@@ -1127,6 +1132,16 @@ bool asCParser::IsDataType(const sToken &token)
 #ifndef AS_NO_COMPILER
 		if( checkValidTypes )
 		{
+			if( IdentifierIs(token, FUNCTION_TOKEN) )
+			{
+				sToken tNext;
+				GetToken(&tNext);
+				RewindTo(&tNext);
+				if( tNext.type == ttLessThan && IsFunctionType(tNext) )
+					return true;
+				return false;
+			}
+
 			// Check if this is an existing type, regardless of namespace
 			tempString.Assign(&script->code[token.pos], token.length);
 			if( !builder->DoesTypeExist(tempString.AddressOf()) )
@@ -1531,13 +1546,187 @@ bool asCParser::IsTemplateTypeList(sToken start, sToken *after)
 	return isTemplateTypeList;
 }
 
+// Returns true if the following tokens form a canonical function type list, e.g. <int(int, float)>
+// The function doesn't move the position
+bool asCParser::IsFunctionType(sToken start, sToken *after)
+{
+	sToken restore;
+	GetToken(&restore);
+
+	RewindTo(&start);
+	bool isFunctionType = true;
+	sToken t1;
+	GetToken(&t1);
+	if (t1.type != ttLessThan)
+		isFunctionType = false;
+
+	if (isFunctionType)
+	{
+		// Return type:
+		// Optional const
+		GetToken(&t1);
+		if (t1.type == ttConst)
+			GetToken(&t1);
+
+		// Optional scope
+		if (t1.type == ttScope)
+			GetToken(&t1);
+		sToken t2;
+		GetToken(&t2);
+		while (t1.type == ttIdentifier && t2.type == ttScope)
+		{
+			GetToken(&t1);
+			GetToken(&t2);
+		}
+		RewindTo(&t2);
+
+		// Return type can be void or a valid data type
+		if (!IsDataType(t1) && t1.type != ttVoid && t1.type != ttAuto)
+			isFunctionType = false;
+
+		if (isFunctionType && !CheckTemplateType(t1))
+			isFunctionType = false;
+
+		if (isFunctionType)
+		{
+			GetToken(&t1);
+			// Optional handle or array brackets or & on return type
+			while (t1.type == ttHandle || t1.type == ttOpenBracket || t1.type == ttAmp)
+			{
+				if (t1.type == ttOpenBracket)
+				{
+					GetToken(&t1);
+					if (t1.type != ttCloseBracket)
+						isFunctionType = false;
+				}
+				else if (t1.type == ttHandle)
+				{
+					GetToken(&t1);
+					if (t1.type != ttConst)
+						RewindTo(&t1);
+				}
+				GetToken(&t1);
+			}
+
+			// Must be open parenthesis '('
+			if (!isFunctionType || t1.type != ttOpenParenthesis)
+				isFunctionType = false;
+			else
+			{
+				// Match balanced parentheses for parameter list
+				int nestParen = 1;
+				while (nestParen > 0)
+				{
+					GetToken(&t1);
+					if (t1.type == ttEnd)
+					{
+						isFunctionType = false;
+						break;
+					}
+					if (t1.type == ttOpenParenthesis)
+						nestParen++;
+					else if (t1.type == ttCloseParenthesis)
+						nestParen--;
+				}
+
+				if (isFunctionType)
+				{
+					// Next token must be '>'
+					GetToken(&t1);
+					if (script->code[t1.pos] != '>')
+						isFunctionType = false;
+				}
+			}
+		}
+	}
+
+	if (after)
+	{
+		if (isFunctionType)
+		{
+			if (t1.length > 1)
+				SetPos(t1.pos + 1);
+
+			GetToken(after);
+		}
+		else
+		{
+			*after = start;
+		}
+	}
+
+	RewindTo(&restore);
+	return isFunctionType;
+}
+
+asCScriptNode *asCParser::ParseFunctionType(asCScriptNode *node)
+{
+	sToken t;
+	GetToken(&t);
+	if (t.type != ttLessThan)
+	{
+		Error(ExpectedToken("<"), &t);
+		return node;
+	}
+
+	asCScriptNode *funcTypeNode = CreateNode(snFunctionType);
+	if (funcTypeNode == 0) return node;
+	node->AddChildLast(funcTypeNode);
+
+	// Parse return type
+	funcTypeNode->AddChildLast(ParseType(true, false, false));
+	if (isSyntaxError) return node;
+
+	// Parse return type modifier
+	funcTypeNode->AddChildLast(ParseTypeMod(false));
+	if (isSyntaxError) return node;
+
+	// Parse parameter list: '(' ... ')'
+	funcTypeNode->AddChildLast(ParseParameterList());
+	if (isSyntaxError) return node;
+
+	// Parse closing '>'
+	GetToken(&t);
+	if (script->code[t.pos] != '>')
+	{
+		Error(ExpectedToken(asCTokenizer::GetDefinition(ttGreaterThan)), &t);
+		Error(InsteadFound(t), &t);
+		return node;
+	}
+	else
+	{
+		// Break the token so only the first > is parsed (handling >> and >>>)
+		SetPos(t.pos + 1);
+	}
+
+	return node;
+}
+
 // This function will return true if the current token is not a template, or if it is and
 // the following has a valid syntax for a template type. The source position will be left
 // at the first token after the type in case of success
 bool asCParser::CheckTemplateType(const sToken &t)
 {
-	// Is this a template type?
 	tempString.Assign(&script->code[t.pos], t.length);
+	if (IdentifierIs(t, FUNCTION_TOKEN))
+	{
+		sToken t1;
+		GetToken(&t1);
+		if (t1.type == ttLessThan)
+		{
+			sToken after;
+			if (IsFunctionType(t1, &after))
+			{
+				RewindTo(&after);
+				return true;
+			}
+			RewindTo(&t1);
+			return false;
+		}
+		RewindTo(&t1);
+		return false;
+	}
+
 	if( engine->IsTemplateType(tempString.AddressOf()) )
 	{
 		sToken t1;
@@ -1554,6 +1743,9 @@ bool asCParser::CheckTemplateType(const sToken &t)
 			RewindTo(&after);
 			return true;
 		}
+
+		RewindTo(&t1);
+		return false;
 	}
 
 	return true;
@@ -1589,11 +1781,16 @@ asCScriptNode *asCParser::ParseCast()
 	if( isSyntaxError ) return node;
 
 	GetToken(&t1);
-	if( t1.type != ttGreaterThan )
+	if( script->code[t1.pos] != '>' )
 	{
 		Error(ExpectedToken(">"), &t1);
 		Error(InsteadFound(t1), &t1);
 		return node;
+	}
+	else
+	{
+		// Break the token so that only the first > is parsed (handling >> and >>>)
+		SetPos(t1.pos + 1);
 	}
 
 	GetToken(&t1);
@@ -1766,16 +1963,47 @@ bool asCParser::IsLambda()
 	{
 		sToken t2;
 		GetToken(&t2);
-		if( t2.type == ttOpenParenthesis)
-		{
-			// Skip until )
-			while( t2.type != ttCloseParenthesis && t2.type != ttEnd )
-				GetToken(&t2);
 
-			// The next token must be a {
-			GetToken(&t2);
-			if( t2.type == ttStartStatementBlock )
-				isLambda = true;
+		if( t2.type == ttOpenBracket )
+		{
+			// Skip until matching ']'
+			int bracketCount = 1;
+			while( bracketCount > 0 && t2.type != ttEnd && t2.type != ttEndStatement )
+			{
+				GetToken(&t2);
+				if( t2.type == ttOpenBracket )
+					bracketCount++;
+				else if( t2.type == ttCloseBracket )
+					bracketCount--;
+			}
+
+			if( bracketCount == 0 )
+			{
+				// After closing ']', next token must be '('
+				GetToken(&t2);
+			}
+		}
+
+		if( t2.type == ttOpenParenthesis )
+		{
+			// Skip until matching ')'
+			int parenCount = 1;
+			while( parenCount > 0 && t2.type != ttEnd && t2.type != ttEndStatement )
+			{
+				GetToken(&t2);
+				if( t2.type == ttOpenParenthesis )
+					parenCount++;
+				else if( t2.type == ttCloseParenthesis )
+					parenCount--;
+			}
+
+			if( parenCount == 0 )
+			{
+				// The next token must be a '{'
+				GetToken(&t2);
+				if( t2.type == ttStartStatementBlock )
+					isLambda = true;
+			}
 		}
 	}
 
@@ -1839,7 +2067,107 @@ asCScriptNode *asCParser::ParseLambda()
 	}
 
 	GetToken(&t);
-	if( t.type != ttOpenParenthesis)
+
+	asCScriptNode *captureListNode = 0;
+	asCArray<asCString> capturedNames;
+
+	// Check for optional capture list: '[' ... ']'
+	if( t.type == ttOpenBracket )
+	{
+		captureListNode = CreateNode(snCaptureList);
+		if( captureListNode == 0 ) return node;
+		node->AddChildLast(captureListNode);
+		captureListNode->UpdateSourcePos(t.pos, t.length);
+
+		GetToken(&t);
+		if( t.type != ttCloseBracket )
+		{
+			for(;;)
+			{
+				// Check for disallowed forms: [&x], [&], [=]
+				if( t.type == ttAmp )
+				{
+					sToken tAmp = t;
+					GetToken(&t);
+					if( t.type == ttIdentifier )
+					{
+						Error(TXT_CAPTURE_BY_REF_NOT_SUPPORTED, &tAmp);
+						return node;
+					}
+					else
+					{
+						Error(TXT_DEFAULT_CAPTURE_NOT_SUPPORTED, &tAmp);
+						return node;
+					}
+				}
+				else if( t.type == ttAssignment )
+				{
+					Error(TXT_DEFAULT_CAPTURE_NOT_SUPPORTED, &t);
+					return node;
+				}
+				else if( t.type == ttIdentifier )
+				{
+					bool isThis = IdentifierIs(t, THIS_TOKEN);
+					asCString capName;
+					capName.Assign(&script->code[t.pos], t.length);
+
+					// Check for duplicate capture
+					for( asUINT i = 0; i < capturedNames.GetLength(); i++ )
+					{
+						if( capturedNames[i] == capName )
+						{
+							if( isThis )
+								Error(TXT_DUPLICATE_CAPTURE_THIS, &t);
+							else
+							{
+								asCString err;
+								err.Format(TXT_DUPLICATE_CAPTURE_s, capName.AddressOf());
+								Error(err, &t);
+							}
+							return node;
+						}
+					}
+
+					capturedNames.PushLast(capName);
+					RewindTo(&t);
+					captureListNode->AddChildLast(ParseIdentifier());
+					if( isSyntaxError ) return node;
+				}
+				else
+				{
+					Error(TXT_EXPECTED_CAPTURE_VAR, &t);
+					return node;
+				}
+
+				GetToken(&t);
+				if( t.type == ttListSeparator )
+				{
+					GetToken(&t);
+					if( t.type == ttCloseBracket )
+					{
+						// Trailing comma
+						Error(TXT_EXPECTED_CAPTURE_VAR, &t);
+						return node;
+					}
+				}
+				else if( t.type == ttCloseBracket )
+				{
+					break;
+				}
+				else
+				{
+					const char *tokens[] = { ",", "]" };
+					Error(ExpectedOneOf(tokens, 2), &t);
+					return node;
+				}
+			}
+		}
+
+		// Advance to next token, which must be '('
+		GetToken(&t);
+	}
+
+	if( t.type != ttOpenParenthesis )
 	{
 		Error(ExpectedToken("("), &t);
 		return node;
@@ -1849,6 +2177,13 @@ asCScriptNode *asCParser::ParseLambda()
 	while (t.type != ttCloseParenthesis && t.type != ttEnd )
 	{
 		RewindTo(&t);
+
+		// Check for empty parameter: e.g. function(,)
+		if( t.type == ttListSeparator )
+		{
+			Error(TXT_EMPTY_LAMBDA_PARAMETER, &t);
+			return node;
+		}
 
 		// Create node to represent the parameter, the datatype and identifier must be children of the node.
 		// If no datatype or identifier is given then the node is still there to be counted as the arg
@@ -1864,9 +2199,11 @@ asCScriptNode *asCParser::ParseLambda()
 		FindIdentifierAfterScope(t2);
 		RewindTo(&t);
 
+		bool hasType = false;
 		// Parse optional type before parameter name
 		if (IsDataType(t2) && CheckTemplateType(t2) && FindTokenAfterType(t) && (t.type == ttIdentifier || t.type == ttListSeparator || t.type == ttCloseParenthesis))
 		{
+			hasType = true;
 			param->AddChildLast(ParseType(true));
 			if (isSyntaxError) return node;
 			param->AddChildLast(ParseTypeMod(true));
@@ -1874,15 +2211,50 @@ asCScriptNode *asCParser::ParseLambda()
 		}
 
 		// Parse optional parameter name
+		bool hasName = false;
+		asCString paramName;
+		sToken nameToken;
 		if (t.type == ttIdentifier)
 		{
+			hasName = true;
+			nameToken = t;
+			paramName.Assign(&script->code[t.pos], t.length);
 			param->AddChildLast(ParseIdentifier());
 			if (isSyntaxError) return node;
 		}
 
+		if( !hasType && !hasName )
+		{
+			Error(TXT_EMPTY_LAMBDA_PARAMETER, &t);
+			return node;
+		}
+
+		// Cross-check parameter name with captured variable names
+		if( hasName && captureListNode )
+		{
+			for( asUINT i = 0; i < capturedNames.GetLength(); i++ )
+			{
+				if( capturedNames[i] == paramName )
+				{
+					asCString err;
+					err.Format(TXT_CAPTURE_CONFLICTS_WITH_PARAM_s, paramName.AddressOf());
+					Error(err, &nameToken);
+					return node;
+				}
+			}
+		}
+
 		GetToken(&t);
 		if (t.type == ttListSeparator)
+		{
 			GetToken(&t);
+			if (t.type == ttCloseParenthesis)
+			{
+				// Trailing comma in parameter list: function(int a, )
+				Error(TXT_EMPTY_LAMBDA_PARAMETER, &t);
+				return node;
+			}
+		}
 		else if (t.type != ttCloseParenthesis)
 		{
 			const char *tokens[] = { ",", ")" };

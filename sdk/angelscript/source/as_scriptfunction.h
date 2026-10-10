@@ -114,7 +114,9 @@ enum asEFuncTrait
 	asTRAIT_EXPLICIT    = 1<<9,  // method
 	asTRAIT_PROPERTY    = 1<<10, // method/function
 	asTRAIT_DELETED     = 1<<11, // method
-	asTRAIT_VARIADIC    = 1<<12  // method/function
+	asTRAIT_VARIADIC    = 1<<12, // method/function
+	asTRAIT_CANONICAL   = 1<<13, // canonical funcdef (function<R(Args)>)
+	asTRAIT_LAMBDA      = 1<<14  // lambda / closure method
 };
 
 struct asSFunctionTraits
@@ -325,6 +327,8 @@ public:
 	asCArray<asCDataType>        parameterTypes;
 	asCArray<asCDataType>        templateSubTypes; // Increase ref of template subtypes
 	asCArray<asCString>          parameterNames;
+	asCArray<asCString>          outerVariableNames;
+	bool                         outerHasThis;
 	asCArray<asETypeModifiers>   inOutFlags;
 	asCArray<asCString *>        defaultArgs;
 	asSFunctionTraits            traits;

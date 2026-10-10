@@ -796,6 +796,7 @@ void asCModule::InternalReset()
 		func->ReleaseInternal();
 	}
 	m_funcDefs.SetLength(0);
+	m_canonicalFuncdefs.SetLength(0);
 
 	// Then release the functions
 	for( n = 0; n < m_scriptFunctions.GetLength(); n++ )

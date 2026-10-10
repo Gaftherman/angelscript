@@ -938,6 +938,7 @@ asCScriptEngine::~asCScriptEngine()
 			funcDefs[n]->ReleaseInternal();
 		}
 	funcDefs.SetLength(0);
+	canonicalFuncdefs.SetLength(0);
 
 	// Free the global properties
 	for( asUINT n = 0; n < globalProperties.GetLength(); n++ )
@@ -6163,6 +6164,7 @@ void asCScriptEngine::RemoveScriptFunction(asCScriptFunction *func)
 void asCScriptEngine::RemoveFuncdef(asCFuncdefType *funcdef)
 {
 	funcDefs.RemoveValue(funcdef);
+	canonicalFuncdefs.RemoveValue(funcdef);
 }
 
 // interface
@@ -6294,6 +6296,123 @@ asCFuncdefType *asCScriptEngine::FindMatchingFuncdef(asCScriptFunction *func, as
 	{
 		// Unless this is a registered funcDef the returned funcDef must
 		// be stored as part of the module for saving/loading bytecode
+		if (!module->m_funcDefs.Exists(funcDef))
+		{
+			module->AddFuncDef(funcDef);
+			funcDef->AddRefInternal();
+		}
+		else
+		{
+			asASSERT(funcDef->IsShared());
+		}
+	}
+
+	return funcDef;
+}
+
+// internal
+asCString asCScriptEngine::FormatCanonicalFuncdefName(const asCDataType &returnType, const asCArray<asCDataType> &parameterTypes, const asCArray<asETypeModifiers> &inOutFlags) const
+{
+	asCString name = "function<";
+	name += returnType.Format(nameSpaces[0], false);
+	name += "(";
+	for (asUINT n = 0; n < parameterTypes.GetLength(); n++)
+	{
+		if (n > 0)
+			name += ", ";
+		name += parameterTypes[n].Format(nameSpaces[0], false);
+		if (parameterTypes[n].IsReference() && inOutFlags.GetLength() > n)
+		{
+			if (inOutFlags[n] == asTM_INREF) name += "in";
+			else if (inOutFlags[n] == asTM_OUTREF) name += "out";
+			else if (inOutFlags[n] == asTM_INOUTREF) name += "inout";
+		}
+	}
+	name += ")>";
+	return name;
+}
+
+// internal
+asCFuncdefType *asCScriptEngine::GetCanonicalFuncdef(const asCDataType &returnType, const asCArray<asCDataType> &parameterTypes, const asCArray<asETypeModifiers> &inOutFlags, asCModule *module)
+{
+	asCFuncdefType *funcDef = 0;
+
+	// Check if the funcdef can be shared across modules.
+	// It is shared unless one of the parameter types or return type is not shared.
+	bool isShared = true;
+	if (returnType.GetTypeInfo() && !returnType.GetTypeInfo()->IsShared())
+		isShared = false;
+	for (asUINT n = 0; isShared && n < parameterTypes.GetLength(); n++)
+	{
+		if (parameterTypes[n].GetTypeInfo() && !parameterTypes[n].GetTypeInfo()->IsShared())
+			isShared = false;
+	}
+
+	if (isShared)
+	{
+		// Search only within the dedicated canonicalFuncdefs cache (O(k), zero string allocations)
+		for (asUINT n = 0; n < canonicalFuncdefs.GetLength(); n++)
+		{
+			asCScriptFunction *cand = canonicalFuncdefs[n]->funcdef;
+			if (cand->parameterTypes.GetLength() != parameterTypes.GetLength())
+				continue;
+			if (cand->IsSignatureExceptNameEqual(returnType, parameterTypes, inOutFlags, 0, false, false))
+			{
+				funcDef = canonicalFuncdefs[n];
+				break;
+			}
+		}
+	}
+	else if (module)
+	{
+		// Search only within the module's dedicated canonical cache
+		for (asUINT n = 0; n < module->m_canonicalFuncdefs.GetLength(); n++)
+		{
+			asCScriptFunction *cand = module->m_canonicalFuncdefs[n]->funcdef;
+			if (cand->parameterTypes.GetLength() != parameterTypes.GetLength())
+				continue;
+			if (cand->IsSignatureExceptNameEqual(returnType, parameterTypes, inOutFlags, 0, false, false))
+			{
+				funcDef = module->m_canonicalFuncdefs[n];
+				break;
+			}
+		}
+	}
+
+	if (funcDef == 0)
+	{
+		// Build the canonical name using the dedicated formatter helper
+		asCString name = FormatCanonicalFuncdefName(returnType, parameterTypes, inOutFlags);
+
+		// Create the canonical funcdef
+		asCScriptFunction *fd = asNEW(asCScriptFunction)(this, isShared ? 0 : module, asFUNC_FUNCDEF);
+		fd->name = name;
+		fd->nameSpace = nameSpaces[0]; // Global namespace
+		fd->SetShared(isShared);
+		fd->traits.SetTrait(asTRAIT_CANONICAL, true);
+
+		fd->returnType = returnType;
+		fd->parameterTypes = parameterTypes;
+		fd->inOutFlags = inOutFlags;
+
+		funcDef = asNEW(asCFuncdefType)(this, fd);
+		funcDefs.PushLast(funcDef); // doesn't increase refCount
+		canonicalFuncdefs.PushLast(funcDef); // register in engine canonical cache
+
+		fd->id = GetNextScriptFunctionId();
+		AddScriptFunction(fd);
+
+		if (module)
+		{
+			funcDef->module = module;
+			module->AddFuncDef(funcDef);
+			if (!isShared)
+				module->m_canonicalFuncdefs.PushLast(funcDef);
+		}
+	}
+
+	if (funcDef && module && funcDef->module != module)
+	{
 		if (!module->m_funcDefs.Exists(funcDef))
 		{
 			module->AddFuncDef(funcDef);

@@ -94,7 +94,9 @@ enum eScriptNode
 	snListPattern,
 	snNamedArgument,
 	snScope,
-	snTryCatch
+	snTryCatch,
+	snCaptureList,
+	snFunctionType
 };
 
 struct sToken

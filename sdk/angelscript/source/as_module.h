@@ -242,6 +242,7 @@ public:
 	asCArray<asCTypedefType*>      m_typeDefs; // increases ref count
 	// This array holds the funcdefs declared in the module
 	asCArray<asCFuncdefType*>      m_funcDefs; // increases ref count
+	asCArray<asCFuncdefType*>      m_canonicalFuncdefs; // doesn't increase ref count
 
 	// This map contains all the types (also contained in the arrays above) for quick lookup
 	// TODO: memory: Can we eliminate the arrays above?

@@ -135,6 +135,8 @@ void asCCompiler::Reset(asCBuilder *in_builder, asCScriptCode *in_script, asCScr
 	m_isConstructor       = false;
 	m_isConstructorCalled = false;
 	m_hasReturned         = false;
+	m_isDeducingReturnType = false;
+	m_deducedReturnType   = asCDataType::CreatePrimitive(ttVoid, false);
 	m_classDecl           = 0;
 	m_globalVar           = 0;
 
@@ -509,7 +511,8 @@ int asCCompiler::SetupParametersAndReturnVariable(asCArray<asCString> &parameter
 	}
 
 	// Is the return type allowed?
-	if( returnType != asCDataType::CreatePrimitive(ttVoid, false) &&
+	if( !m_isDeducingReturnType &&
+		returnType != asCDataType::CreatePrimitive(ttVoid, false) &&
 		!returnType.CanBeInstantiated() &&
 		!returnType.IsReference() &&
 		!returnType.IsObjectHandle() )
@@ -1469,7 +1472,7 @@ void asCCompiler::CompileStatementBlock(asCScriptNode *block, bool ownVariableSc
 		LineInstr(bc, node->tokenPos);
 		bc->AddCode(&statement);
 
-		if( !hasCompileErrors )
+		if( !hasCompileErrors && !m_isDeducingReturnType )
 		{
 			asASSERT( tempVariables.GetLength() == 0 );
 			asASSERT( reservedVariables.GetLength() == 0 );
@@ -3098,12 +3101,70 @@ bool asCCompiler::CompileAutoType(asCDataType &type, asCExprContext &compiledCtx
 				return false;
 			}
 
-			// Must not have unused anonymous functions
+			// Handle anonymous functions (lambdas)
 			if (compiledCtx.IsLambda())
 			{
-				// TODO: Should mention that the problem is the anonymous function
-				Error(TXT_CANNOT_RESOLVE_AUTO, errNode);
-				return false;
+				asCArray<asCDataType> paramTypes;
+				asCArray<asCString> paramNames;
+				asCArray<asETypeModifiers> inOutFlags;
+
+				asSNameSpace *ns = outFunc ? outFunc->nameSpace : (m_globalVar ? m_globalVar->ns : engine->nameSpaces[0]);
+				asCObjectType *ot = outFunc ? outFunc->objectType : 0;
+
+				asCScriptNode *argNode = compiledCtx.exprNode->firstChild;
+				while (argNode && argNode->nodeType != snStatementBlock)
+				{
+					if (argNode->nodeType == snUndefined)
+					{
+						asCScriptNode *typeNode = argNode->firstChild;
+						// Parameter must have an explicit type when using auto
+						if (!typeNode || typeNode->nodeType != snDataType)
+						{
+							Error(TXT_LAMBDA_PARAMS_MUST_BE_TYPED_FOR_AUTO, argNode);
+							return false;
+						}
+
+						asCDataType dt = builder->CreateDataTypeFromNode(typeNode, script, ns, false, ot, true, 0, 0, &m_namespaceVisibility);
+						asETypeModifiers inOutFlag;
+						dt = builder->ModifyDataTypeFromNode(dt, typeNode->next, script, &inOutFlag, 0);
+
+						paramTypes.PushLast(dt);
+						inOutFlags.PushLast(inOutFlag);
+
+						if (argNode->lastChild && argNode->lastChild->nodeType == snIdentifier)
+						{
+							asCString pName;
+							pName.Assign(&script->code[argNode->lastChild->tokenPos], argNode->lastChild->tokenLength);
+							paramNames.PushLast(pName);
+						}
+						else
+						{
+							paramNames.PushLast("");
+						}
+					}
+					argNode = argNode->next;
+				}
+
+				asCDataType retType = DeduceLambdaReturnType(compiledCtx.exprNode, script, paramTypes, paramNames, inOutFlags, outFunc);
+				if (retType.GetTokenType() == ttUnrecognizedToken)
+				{
+					return false;
+				}
+
+				asCFuncdefType *canonFuncdef = engine->GetCanonicalFuncdef(retType, paramTypes, inOutFlags, builder ? builder->module : 0);
+				if (!canonFuncdef)
+				{
+					Error(TXT_CANNOT_RESOLVE_AUTO, errNode);
+					return false;
+				}
+
+				asCDataType canonType = asCDataType::CreateType(canonFuncdef, false);
+				canonType.MakeHandle(true);
+				asUINT conv = ImplicitConvLambdaToFunc(&compiledCtx, canonType, errNode, asIC_IMPLICIT_CONV, true);
+				if (conv == asCC_NO_CONV)
+				{
+					return false;
+				}
 			}
 
 			// Must not be a null handle
@@ -6120,6 +6181,68 @@ void asCCompiler::CompileReturnStatement(asCScriptNode *rnode, asCByteCode *bc)
 	// Get return type and location
 	sVariable *v = variables->GetVariable("return");
 
+	if( m_isDeducingReturnType )
+	{
+		asCDataType deduced;
+		asCExprContext expr(engine);
+		if( !rnode->firstChild )
+		{
+			// return; without expression
+			deduced = asCDataType::CreatePrimitive(ttVoid, false);
+		}
+		else
+		{
+			int r = CompileAssignment(rnode->firstChild, &expr);
+			if( r < 0 ) return;
+
+			if( ProcessPropertyGetAccessor(&expr, rnode) < 0 )
+				return;
+
+			if( expr.type.dataType.IsNullHandle() )
+			{
+				Error(TXT_CANNOT_DEDUCE_RETURN_FROM_NULL, rnode);
+				return;
+			}
+
+			deduced = expr.type.dataType;
+
+			// Reference decay: function return by value cannot return reference
+			deduced.MakeReference(false);
+
+			// Const on value types decays
+			if( !deduced.IsObjectHandle() )
+				deduced.MakeReadOnly(false);
+
+			// Object handle preservation
+			if( expr.type.dataType.IsObjectHandle() || expr.type.isExplicitHandle )
+				deduced.MakeHandle(true);
+		}
+
+		if( m_deducedReturnType.IsAuto() )
+		{
+			// First return statement in the function fixes the deduced return type
+			m_deducedReturnType = deduced;
+			v->type = deduced;
+		}
+		else if( m_deducedReturnType != deduced )
+		{
+			// Subsequent return statement must match previously deduced type
+			asCString str;
+			str.Format(TXT_DIVERGENT_RETURN_TYPES_s_s, m_deducedReturnType.Format(outFunc->nameSpace).AddressOf(), deduced.Format(outFunc->nameSpace).AddressOf());
+			Error(str, rnode);
+		}
+
+		if (rnode->firstChild)
+		{
+			ProcessDeferredParams(&expr);
+			ReleaseTemporaryVariable(expr.type, &expr.bc);
+		}
+		tempVariables.SetLength(0);
+		reservedVariables.SetLength(0);
+
+		return;
+	}
+
 	// Basic validations
 	if( v->type.GetSizeOnStackDWords() > 0 && !rnode->firstChild )
 	{
@@ -7789,6 +7912,9 @@ asCString asCCompiler::BuildLambdaSignature(asCScriptNode* node)
 {
 	asCScriptNode* argNode = node->firstChild;
 
+	asSNameSpace *ns = outFunc ? outFunc->nameSpace : (m_globalVar ? m_globalVar->ns : engine->nameSpaces[0]);
+	asCObjectType *ot = outFunc ? outFunc->objectType : 0;
+
 	asCArray<asCDataType> lambdaParamTypes;
 	asCArray<asETypeModifiers> lambdaInOutFlags;
 	while (argNode->nodeType != snStatementBlock)
@@ -7801,7 +7927,7 @@ asCString asCCompiler::BuildLambdaSignature(asCScriptNode* node)
 			// Check if the specified parameter types match the funcdef
 			if (typeNode->nodeType == snDataType)
 			{
-				asCDataType dt = builder->CreateDataTypeFromNode(typeNode, script, outFunc->nameSpace, false, outFunc->objectType, true, 0, 0, &m_namespaceVisibility);
+				asCDataType dt = builder->CreateDataTypeFromNode(typeNode, script, ns, false, ot, true, 0, 0, &m_namespaceVisibility);
 				asETypeModifiers inOutFlag;
 				dt = builder->ModifyDataTypeFromNode(dt, typeNode->next, script, &inOutFlag, 0);
 
@@ -7822,16 +7948,250 @@ asCString asCCompiler::BuildLambdaSignature(asCScriptNode* node)
 	for (asUINT n = 0; n < lambdaParamTypes.GetLength(); n++)
 	{
 		if (n > 0) decl += ", ";
-		decl += lambdaParamTypes[n].Format(outFunc->nameSpace);
+		decl += lambdaParamTypes[n].Format(ns);
 	}
 	decl += ")";
 	
 	return decl;
 }
 
+asCDataType asCCompiler::DeduceLambdaReturnType(asCScriptNode *funcNode, asCScriptCode *file, const asCArray<asCDataType> &paramTypes, const asCArray<asCString> &paramNames, const asCArray<asETypeModifiers> &inOutFlags, asCScriptFunction *enclosingFunc)
+{
+	asCScriptFunction dummyFunc(engine, builder ? builder->module : 0, asFUNC_DUMMY);
+	dummyFunc.AllocateScriptFunctionData();
+	dummyFunc.name = "$lambda_deduce";
+	dummyFunc.nameSpace = enclosingFunc ? enclosingFunc->nameSpace : (m_globalVar ? m_globalVar->ns : engine->nameSpaces[0]);
+	dummyFunc.parameterTypes = paramTypes;
+	dummyFunc.inOutFlags = inOutFlags;
+	dummyFunc.returnType = asCDataType::CreateAuto(false);
+
+	asCCompiler deduceCompiler(engine);
+	deduceCompiler.Reset(builder, file, &dummyFunc);
+	deduceCompiler.m_namespaceVisibility = m_namespaceVisibility;
+	deduceCompiler.m_isDeducingReturnType = true;
+	deduceCompiler.m_deducedReturnType = asCDataType::CreateAuto(false);
+
+	asCArray<asCString> mutableParamNames = paramNames;
+	int stackPos = deduceCompiler.SetupParametersAndReturnVariable(mutableParamNames, funcNode);
+	if (deduceCompiler.hasCompileErrors)
+		return asCDataType::CreatePrimitive(ttUnrecognizedToken, true);
+
+	// Declare captured variables in the deduce compiler so they are recognized in the body
+	if (funcNode->firstChild && funcNode->firstChild->nodeType == snCaptureList)
+	{
+		asCScriptNode *cap = funcNode->firstChild->firstChild;
+		while (cap)
+		{
+			asCString capName;
+			capName.Assign(&file->code[cap->tokenPos], cap->tokenLength);
+			if (capName == "this")
+			{
+				if (enclosingFunc && enclosingFunc->objectType)
+					dummyFunc.objectType = enclosingFunc->objectType;
+			}
+			else
+			{
+				sVariable *v = variables ? variables->GetVariable(capName.AddressOf()) : 0;
+				if (v)
+				{
+					deduceCompiler.variables->DeclareVariable(capName.AddressOf(), v->type, stackPos, false);
+					stackPos -= v->type.GetSizeOnStackDWords();
+				}
+				else if (enclosingFunc && enclosingFunc->objectType)
+				{
+					asCObjectProperty *prop = builder->GetObjectProperty(asCDataType::CreateType(enclosingFunc->objectType, false), capName.AddressOf());
+					if (prop)
+					{
+						deduceCompiler.variables->DeclareVariable(capName.AddressOf(), prop->type, stackPos, false);
+						stackPos -= prop->type.GetSizeOnStackDWords();
+					}
+				}
+			}
+			cap = cap->next;
+		}
+	}
+
+	asCArray<asCString> outerVars;
+	bool outerHasThis = false;
+	GetOuterVariables(outerVars, outerHasThis);
+	dummyFunc.outerVariableNames = outerVars;
+	dummyFunc.outerHasThis = outerHasThis;
+
+	asCScriptNode *blockBegin = funcNode->lastChild;
+	if (blockBegin == 0 || blockBegin->nodeType != snStatementBlock)
+		return asCDataType::CreatePrimitive(ttUnrecognizedToken, true);
+
+	asCParser parser(builder);
+	int r = parser.ParseStatementBlock(file, blockBegin);
+	if (r < 0)
+		return asCDataType::CreatePrimitive(ttUnrecognizedToken, true);
+	asCScriptNode *block = parser.GetScriptNode();
+
+	deduceCompiler.nextLabel++;
+	bool hasReturn = false;
+	asCByteCode bc(engine);
+	deduceCompiler.CompileStatementBlock(block, false, &hasReturn, &bc);
+
+	if (deduceCompiler.hasCompileErrors)
+		return asCDataType::CreatePrimitive(ttUnrecognizedToken, true);
+
+	if (deduceCompiler.m_deducedReturnType.IsAuto())
+	{
+		// No return statements with values, so return type is void
+		return asCDataType::CreatePrimitive(ttVoid, false);
+	}
+
+	return deduceCompiler.m_deducedReturnType;
+}
+
+void asCCompiler::GetOuterVariables(asCArray<asCString> &outerVars, bool &outerHasThis)
+{
+	outerVars.SetLength(0);
+	outerHasThis = false;
+
+	// Collect local variables and parameters from variable scopes
+	asCVariableScope *vs = variables;
+	while (vs)
+	{
+		for (asUINT n = 0; n < vs->variables.GetLength(); n++)
+		{
+			if (vs->variables[n]->name != "" && vs->variables[n]->name != "return")
+			{
+				if (outerVars.IndexOf(vs->variables[n]->name) < 0)
+					outerVars.PushLast(vs->variables[n]->name);
+			}
+		}
+		vs = vs->parent;
+	}
+
+	// Check if this method has 'this'
+	if (outFunc && outFunc->objectType)
+	{
+		outerHasThis = true;
+		for (asUINT p = 0; p < outFunc->objectType->properties.GetLength(); p++)
+		{
+			if (outerVars.IndexOf(outFunc->objectType->properties[p]->name) < 0)
+				outerVars.PushLast(outFunc->objectType->properties[p]->name);
+		}
+	}
+
+	// Propagate outer variables from enclosing lambda/closure (nested closures)
+	if (outFunc)
+	{
+		for (asUINT o = 0; o < outFunc->outerVariableNames.GetLength(); o++)
+		{
+			if (outerVars.IndexOf(outFunc->outerVariableNames[o]) < 0)
+				outerVars.PushLast(outFunc->outerVariableNames[o]);
+		}
+		if (outFunc->outerHasThis)
+			outerHasThis = true;
+	}
+}
+
+struct sClosureCaptureItem
+{
+	sClosureCaptureItem() : isThis(false) {}
+	asCString name;
+	asCDataType type;
+	bool isThis;
+};
+
 asUINT asCCompiler::ImplicitConvLambdaToFunc(asCExprContext *ctx, const asCDataType &to, asCScriptNode * /*node*/, EImplicitConv /*convType*/, bool generateCode)
 {
 	asASSERT( to.IsFuncdef() && ctx->IsLambda() );
+
+	asSNameSpace *ns = outFunc ? outFunc->nameSpace : (m_globalVar ? m_globalVar->ns : engine->nameSpaces[0]);
+	asCObjectType *ot = outFunc ? outFunc->objectType : 0;
+
+	asCArray<asCString> outerVars;
+	bool outerHasThis = false;
+	GetOuterVariables(outerVars, outerHasThis);
+
+	asCArray<sClosureCaptureItem> captures;
+
+	asCScriptNode *capListNode = (ctx->exprNode && ctx->exprNode->firstChild && ctx->exprNode->firstChild->nodeType == snCaptureList) ? ctx->exprNode->firstChild : 0;
+	if (capListNode)
+	{
+		asCScriptNode *cap = capListNode->firstChild;
+		while (cap)
+		{
+			asCString capName;
+			capName.Assign(&script->code[cap->tokenPos], cap->tokenLength);
+
+			sClosureCaptureItem item;
+			item.name = capName;
+
+			if (capName == "this")
+			{
+				if (!outFunc || !outFunc->objectType)
+				{
+					Error(TXT_CANNOT_CAPTURE_THIS_OUTSIDE_METHOD, cap);
+					return asCC_NO_CONV;
+				}
+				item.isThis = true;
+				item.type = asCDataType::CreateObjectHandle(outFunc->objectType, false);
+				if (outFunc->IsReadOnly())
+					item.type.MakeHandleToConst(true);
+			}
+			else
+			{
+				item.isThis = false;
+				sVariable *var = variables ? variables->GetVariable(capName.AddressOf()) : 0;
+				if (var)
+				{
+					item.type = var->type;
+				}
+				else if (outFunc && outFunc->objectType)
+				{
+					asCObjectProperty *prop = builder->GetObjectProperty(asCDataType::CreateType(outFunc->objectType, false), capName.AddressOf());
+					if (prop)
+						item.type = prop->type;
+				}
+
+				if (item.type.GetTokenType() == ttUnrecognizedToken)
+				{
+					asCString msg;
+					msg.Format(TXT_CAPTURE_VARIABLE_s_NOT_FOUND, capName.AddressOf());
+					Error(msg, cap);
+					return asCC_NO_CONV;
+				}
+
+				// Check copyability
+				asCDataType decayedType = item.type;
+				decayedType.MakeReference(false);
+				decayedType.MakeReadOnly(false);
+
+				if (decayedType.IsObject() && !decayedType.IsObjectHandle())
+				{
+					if (decayedType.GetTypeInfo()->flags & asOBJ_REF)
+					{
+						asCString msg;
+						msg.Format(TXT_CANNOT_COPY_NONCOPYABLE_TYPE_s, decayedType.Format(ns).AddressOf());
+						Error(msg, cap);
+						return asCC_NO_CONV;
+					}
+					else if (decayedType.GetTypeInfo()->flags & asOBJ_VALUE)
+					{
+						if (!(decayedType.GetTypeInfo()->flags & asOBJ_POD))
+						{
+							asSTypeBehaviour *beh = decayedType.GetBehaviour();
+							if (!(beh && (beh->copyconstruct || beh->copy)))
+							{
+								asCString msg;
+								msg.Format(TXT_CANNOT_COPY_NONCOPYABLE_TYPE_s, decayedType.Format(ns).AddressOf());
+								Error(msg, cap);
+								return asCC_NO_CONV;
+							}
+						}
+					}
+				}
+				item.type = decayedType;
+			}
+
+			captures.PushLast(item);
+			cap = cap->next;
+		}
+	}
 
 	asCScriptFunction *funcDef = CastToFuncdefType(to.GetTypeInfo())->funcdef;
 
@@ -7848,7 +8208,7 @@ asUINT asCCompiler::ImplicitConvLambdaToFunc(asCExprContext *ctx, const asCDataT
 			// Check if the specified parameter types match the funcdef
 			if (typeNode->nodeType == snDataType)
 			{
-				asCDataType dt = builder->CreateDataTypeFromNode(typeNode, script, outFunc->nameSpace, false, outFunc->objectType, true, 0, 0, &m_namespaceVisibility);
+				asCDataType dt = builder->CreateDataTypeFromNode(typeNode, script, ns, false, ot, true, 0, 0, &m_namespaceVisibility);
 				asETypeModifiers inOutFlag;
 				dt = builder->ModifyDataTypeFromNode(dt, typeNode->next, script, &inOutFlag, 0);
 
@@ -7873,29 +8233,159 @@ asUINT asCCompiler::ImplicitConvLambdaToFunc(asCExprContext *ctx, const asCDataT
 
 	if( generateCode )
 	{
-		// Build a unique name for the anonymous function
-		asCString name;
-		for (int iterations = 0;; iterations++)
+		bool isShared = outFunc ? outFunc->IsShared() : false;
+		if (captures.GetLength() == 0)
 		{
-			name.Format(iterations == 0 ? "$%s$%d" : "$%s$%d(%d)", m_globalVar ? m_globalVar->name.AddressOf() : outFunc->GetDeclaration(), numLambdas, iterations);
+			// Build a unique name for the anonymous function
+			asCString name;
+			for (int iterations = 0;; iterations++)
+			{
+				name.Format(iterations == 0 ? "$%s$%d" : "$%s$%d(%d)", m_globalVar ? m_globalVar->name.AddressOf() : outFunc->GetDeclaration(), numLambdas, iterations);
 
-			// Check if a function with the same name already exists (this can happen if the function 
-			// that declares the lambda has been removed and then is compiled again with 
-			// asIScriptModule::CompileFunction)
-			asCArray<int> funcs;
-			builder->GetFunctionDescriptions(name.AddressOf(), funcs, outFunc->nameSpace);
-			if (funcs.GetLength() == 0)
-				break;
+				// Check if a function with the same name already exists (this can happen if the function 
+				// that declares the lambda has been removed and then is compiled again with 
+				// asIScriptModule::CompileFunction)
+				asCArray<int> funcs;
+				builder->GetFunctionDescriptions(name.AddressOf(), funcs, ns);
+				if (funcs.GetLength() == 0)
+					break;
+			}
+			numLambdas++;
+
+			// Register the lambda with the builder for later compilation
+			asCScriptFunction *func = builder->RegisterLambda(ctx->exprNode, script, funcDef, name, ns, isShared, 0, &outerVars, outerHasThis);
+			asASSERT( func == 0 || funcDef->IsSignatureExceptNameEqual(func) );
+			ctx->bc.InstrPTR(asBC_FuncPtr, func);
+
+			// Clear the expression node as it is no longer valid
+			ctx->exprNode = 0;
 		}
-		numLambdas++;
+		else
+		{
+			// Stateful closure: synthesize closure class, copy captured properties, wrap in delegate
+			asCString closureClassName;
+			for (int iterations = 0;; iterations++)
+			{
+				closureClassName.Format(iterations == 0 ? "$closure$%s$%d" : "$closure$%s$%d(%d)", m_globalVar ? m_globalVar->name.AddressOf() : outFunc->GetDeclaration(), numLambdas, iterations);
+				if (!builder->module || builder->module->GetType(closureClassName.AddressOf(), ns) == 0)
+					break;
+			}
+			numLambdas++;
 
-		// Register the lambda with the builder for later compilation
-		asCScriptFunction *func = builder->RegisterLambda(ctx->exprNode, script, funcDef, name, outFunc->nameSpace, outFunc->IsShared());
-		asASSERT( func == 0 || funcDef->IsSignatureExceptNameEqual(func) );
-		ctx->bc.InstrPTR(asBC_FuncPtr, func);
+			asCObjectType *closureType = builder->SynthesizeClosureClass(closureClassName, ns, isShared, script);
+			if (!closureType)
+				return asCC_NO_CONV;
 
-		// Clear the expression node as it is no longer valid
-		ctx->exprNode = 0;
+			// Add captured properties to the closure class
+			for (asUINT c = 0; c < captures.GetLength(); c++)
+			{
+				if (captures[c].isThis)
+					closureType->AddPropertyToClass("$this", captures[c].type, false, false, false);
+				else
+					closureType->AddPropertyToClass(captures[c].name, captures[c].type, false, false, false);
+			}
+
+			// Register lambda method as $call on closureType
+			asCString methodName = "$call";
+			asCScriptFunction *func = builder->RegisterLambda(ctx->exprNode, script, funcDef, methodName, ns, isShared, closureType, &outerVars, outerHasThis);
+			asASSERT(func == 0 || funcDef->IsSignatureExceptNameAndObjectTypeEqual(func));
+
+			// Setup virtual function table and methods for delegate dispatch
+			closureType->virtualFunctionTable.PushLast(func);
+			int vfId = builder->CreateVirtualFunction(func, (int)closureType->virtualFunctionTable.GetLength() - 1);
+			closureType->methods[closureType->methods.GetLength() - 1] = vfId;
+			asCScriptFunction *vf = engine->scriptFunctions[vfId];
+
+			// Emit runtime instantiation bytecode:
+			// 1. Allocate closure instance
+			asCDataType closureDataType = asCDataType::CreateType(closureType, false);
+			int closureObjOffset = AllocateVariable(closureDataType, true);
+			ctx->bc.InstrSHORT(asBC_PSF, (short)closureObjOffset);
+			ctx->bc.Alloc(asBC_ALLOC, closureType, closureType->beh.construct, AS_PTR_SIZE, 0);
+
+			// 2. Initialize captured properties
+			for (asUINT c = 0; c < captures.GetLength(); c++)
+			{
+				asCString propName = captures[c].isThis ? "$this" : captures[c].name;
+				asCObjectProperty *prop = builder->GetObjectProperty(closureDataType, propName.AddressOf());
+				asASSERT(prop);
+
+				// Prepare source expression (rctx)
+				asCExprContext rctx(engine);
+				if (captures[c].isThis)
+				{
+					rctx.bc.InstrSHORT(asBC_PSF, 0);
+					rctx.bc.Instr(asBC_RDSPtr);
+					asCDataType thisDt = asCDataType::CreateObjectHandle(outFunc->objectType, false);
+					if (outFunc->IsReadOnly())
+						thisDt.MakeHandleToConst(true);
+					rctx.type.SetVariable(thisDt, 0, false);
+					rctx.type.isExplicitHandle = true;
+				}
+				else
+				{
+					CompileVariableAccess(captures[c].name, "", &rctx, ctx->exprNode);
+					if (prop->type.IsObjectHandle() || prop->type.IsFuncdef())
+					{
+						Dereference(&rctx, true);
+						rctx.type.isExplicitHandle = true;
+					}
+					else if (rctx.type.dataType.IsPrimitive() && rctx.type.dataType.IsReference())
+					{
+						ConvertToVariable(&rctx);
+					}
+				}
+
+				// Prepare destination expression (lctx)
+				asCExprContext lctx(engine);
+				lctx.bc.InstrSHORT(asBC_PSF, (short)closureObjOffset);
+				lctx.bc.Instr(asBC_RDSPtr);
+				lctx.bc.InstrSHORT_DW(asBC_ADDSi, (short)prop->byteOffset, engine->GetTypeIdFromDataType(closureDataType));
+				if (prop->type.IsReference())
+					lctx.bc.Instr(asBC_RDSPtr);
+				if (prop->type.IsPrimitive())
+					lctx.bc.Instr(asBC_PopRPtr);
+				lctx.type.dataType = prop->type;
+				lctx.type.dataType.MakeReference(true);
+				lctx.type.isVariable = false;
+				lctx.type.isLValue = true;
+				if (prop->type.IsObjectHandle() || prop->type.IsFuncdef())
+					lctx.type.isExplicitHandle = true;
+
+				MergeExprBytecode(ctx, &rctx);
+				MergeExprBytecode(ctx, &lctx);
+
+				PerformAssignment(&lctx.type, &rctx.type, &ctx->bc, ctx->exprNode);
+				ReleaseTemporaryVariable(rctx.type, &ctx->bc);
+
+				if (!prop->type.IsPrimitive())
+					ctx->bc.Instr(asBC_PopPtr);
+			}
+
+			// 3. Create delegate: push closureObj, push vf, call $dlgte
+			ctx->bc.InstrSHORT(asBC_PSF, (short)closureObjOffset);
+			ctx->bc.Instr(asBC_RDSPtr);
+			ctx->bc.InstrPTR(asBC_FuncPtr, vf);
+
+			asCArray<int> delegateFuncs;
+			builder->GetFunctionDescriptions(DELEGATE_FACTORY, delegateFuncs, engine->nameSpaces[0]);
+			asASSERT(delegateFuncs.GetLength() == 1);
+			ctx->bc.Call(asBC_CALLSYS, delegateFuncs[0], 2 * AS_PTR_SIZE, 0);
+
+			// 4. Store delegate in return variable
+			int returnOffset = AllocateVariable(to, true, false);
+			asCDataType dt = to;
+			dt.MakeReference(false);
+			ctx->type.SetVariable(dt, returnOffset, true);
+			ctx->type.isExplicitHandle = true;
+			ctx->bc.InstrSHORT(asBC_STOREOBJ, (short)returnOffset);
+			ctx->bc.InstrSHORT(asBC_PshVPtr, (short)returnOffset);
+
+			// 5. Release temporary closure object variable
+			ReleaseTemporaryVariable(closureObjOffset, &ctx->bc);
+
+			ctx->exprNode = 0;
+		}
 	}
 
 	return asCC_CONST_CONV;
@@ -10476,6 +10966,17 @@ int asCCompiler::CompileCondition(asCScriptNode *expr, asCExprContext *ctx)
 				re.type.dataType.MakeHandleToConst(true);
 			}
 
+			if (le.IsLambda())
+			{
+				Error(TXT_CANNOT_RESOLVE_AUTO, cexpr->next);
+				return -1;
+			}
+			if (re.IsLambda())
+			{
+				Error(TXT_CANNOT_RESOLVE_AUTO, cexpr->next->next);
+				return -1;
+			}
+
 			// Make sure both expressions have the same type
 			if (!le.type.dataType.IsEqualExceptRefAndConst(re.type.dataType))
 			{
@@ -11455,8 +11956,53 @@ int asCCompiler::CompileVariableAccess(const asCString &name, const asCString &s
 		// Give dummy value
 		ctx->type.SetDummy();
 
+		// If outFunc is a closure method, check if $this was captured and whether member exists on $this
+		if (scope == "" && outFunc && outFunc->objectType && outFunc->traits.GetTrait(asTRAIT_LAMBDA))
+		{
+			asCObjectProperty *propThis = builder->GetObjectProperty(asCDataType::CreateType(outFunc->objectType, false), "$this");
+			if (propThis)
+			{
+				asCObjectProperty *propOuter = builder->GetObjectProperty(propThis->type, name.AddressOf());
+				if (propOuter)
+				{
+					// Load captured $this then access member
+					ctx->bc.InstrSHORT(asBC_PSF, 0);
+					ctx->bc.Instr(asBC_RDSPtr);
+					ctx->bc.InstrSHORT_DW(asBC_ADDSi, (short)propThis->byteOffset, engine->GetTypeIdFromDataType(asCDataType::CreateType(outFunc->objectType, false)));
+					ctx->bc.Instr(asBC_RDSPtr);
+					ctx->bc.InstrSHORT_DW(asBC_ADDSi, (short)propOuter->byteOffset, engine->GetTypeIdFromDataType(propThis->type));
+					if (propOuter->type.IsReference())
+						ctx->bc.Instr(asBC_RDSPtr);
+					if (propOuter->type.IsPrimitive())
+						ctx->bc.Instr(asBC_PopRPtr);
+					ctx->type.dataType = propOuter->type;
+					ctx->type.dataType.MakeReference(true);
+					ctx->type.isVariable = false;
+					ctx->type.isTemporary = false;
+					ctx->type.isLValue = true;
+					return 0;
+				}
+			}
+		}
+
 		if (!isOptional)
 		{
+			if (scope == "")
+			{
+				if (name == THIS_TOKEN && outFunc && outFunc->outerHasThis)
+				{
+					Error(TXT_THIS_NOT_CAPTURED, errNode);
+					return -1;
+				}
+				if (outFunc && outFunc->outerVariableNames.IndexOf(name) >= 0)
+				{
+					asCString msg;
+					msg.Format(TXT_VARIABLE_s_NOT_CAPTURED, name.AddressOf(), name.AddressOf());
+					Error(msg, errNode);
+					return -1;
+				}
+			}
+
 			// No matching symbol
 			asCString msg;
 			asCString smbl;
@@ -11534,6 +12080,30 @@ int asCCompiler::CompileVariableAccess(const asCString &name, const asCString &s
 		if (symbolType == SL_THISPTR)
 		{
 			asASSERT(name == THIS_TOKEN && !objType && scope == "");
+
+			// If outFunc is a closure method, check if $this was captured
+			if (outFunc && outFunc->objectType && outFunc->traits.GetTrait(asTRAIT_LAMBDA))
+			{
+				asCObjectProperty *propThis = builder->GetObjectProperty(asCDataType::CreateType(outFunc->objectType, false), "$this");
+				if (propThis)
+				{
+					// Load the captured $this property
+					ctx->bc.InstrSHORT(asBC_PSF, 0);
+					ctx->bc.Instr(asBC_RDSPtr);
+					ctx->bc.InstrSHORT_DW(asBC_ADDSi, (short)propThis->byteOffset, engine->GetTypeIdFromDataType(asCDataType::CreateType(outFunc->objectType, false)));
+					ctx->bc.Instr(asBC_RDSPtr);
+					ctx->type.Set(propThis->type);
+					ctx->type.isLValue = true;
+					ctx->type.isRefSafe = true;
+					return 0;
+				}
+				else if (outFunc->outerHasThis)
+				{
+					Error(TXT_THIS_NOT_CAPTURED, errNode);
+					return -1;
+				}
+			}
+
 			asCDataType dt = asCDataType::CreateType(outFunc->objectType, outFunc->IsReadOnly());
 
 			// The object pointer is located at stack position 0
@@ -13212,17 +13782,63 @@ int asCCompiler::CompileFunctionCall(asCScriptNode *node, asCExprContext *ctx, a
 		return -1;
 	if (symbolType == SL_NOMATCH)
 	{
-		// No matching symbol
-		asCString msg;
-		asCString smbl;
-		if (scope == "::")
-			smbl = scope;
-		else if (scope != "")
-			smbl = scope + "::";
-		smbl += name;
-		msg.Format(TXT_NO_MATCHING_SYMBOL_s, smbl.AddressOf());
-		Error(msg, node);
-		return -1;
+		if (scope == "" && outFunc && outFunc->objectType && outFunc->traits.GetTrait(asTRAIT_LAMBDA))
+		{
+			asCObjectProperty *propThis = builder->GetObjectProperty(asCDataType::CreateType(outFunc->objectType, false), "$this");
+			if (propThis)
+			{
+				asCObjectType *outerType = CastToObjectType(propThis->type.GetTypeInfo());
+				if (outerType)
+				{
+					asCArray<int> outerFuncs;
+					builder->GetObjectMethodDescriptions(name.AddressOf(), outerType, outerFuncs, false);
+					if (outerFuncs.GetLength() > 0)
+					{
+						funcExpr.bc.InstrSHORT(asBC_PSF, 0);
+						funcExpr.bc.Instr(asBC_RDSPtr);
+						funcExpr.bc.InstrSHORT_DW(asBC_ADDSi, (short)propThis->byteOffset, engine->GetTypeIdFromDataType(asCDataType::CreateType(outFunc->objectType, false)));
+						funcExpr.bc.Instr(asBC_RDSPtr);
+						funcExpr.type.Set(propThis->type);
+						funcExpr.type.isLValue = true;
+						funcExpr.type.isRefSafe = true;
+						objectType = outerType;
+						funcs = outerFuncs;
+						symbolType = SL_CLASSMETHOD;
+					}
+				}
+			}
+		}
+
+		if (symbolType == SL_NOMATCH)
+		{
+			if (scope == "")
+			{
+				if (name == THIS_TOKEN && outFunc && outFunc->outerHasThis)
+				{
+					Error(TXT_THIS_NOT_CAPTURED, node);
+					return -1;
+				}
+				if (outFunc && outFunc->outerVariableNames.IndexOf(name) >= 0)
+				{
+					asCString msg;
+					msg.Format(TXT_VARIABLE_s_NOT_CAPTURED, name.AddressOf(), name.AddressOf());
+					Error(msg, node);
+					return -1;
+				}
+			}
+
+			// No matching symbol
+			asCString msg;
+			asCString smbl;
+			if (scope == "::")
+				smbl = scope;
+			else if (scope != "")
+				smbl = scope + "::";
+			smbl += name;
+			msg.Format(TXT_NO_MATCHING_SYMBOL_s, smbl.AddressOf());
+			Error(msg, node);
+			return -1;
+		}
 	}
 
 	// Is the symbol matching a variable/property?

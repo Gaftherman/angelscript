@@ -142,6 +142,7 @@ namespace TestOperator          { bool Test(); }
 namespace TestGetSet            { bool Test(); }
 namespace TestModule            { bool Test(); }
 namespace TestFunctionPtr       { bool Test(); }
+namespace TestLambda            { bool Test(); }
 namespace TestGarbageCollect    { bool Test(); }
 namespace TestScriptRetRef      { bool Test(); }
 namespace TestDefaultArg        { bool Test(); }
@@ -275,6 +276,7 @@ int allTests()
 		if( TestScriptRetRef::Test()                ) goto failed; else PRINTF("-- TestScriptRetRef passed\n");
 		if( TestGarbageCollect::Test()              ) goto failed; else PRINTF("-- TestGarbageCollect passed\n");
 		if( TestFunctionPtr::Test()                 ) goto failed; else PRINTF("-- TestFunctionPtr passed\n");
+		if( TestLambda::Test()                      ) goto failed; else PRINTF("-- TestLambda passed\n");
 		if( TestModule::Test()                      ) goto failed; else PRINTF("-- TestModule passed\n");
 		if( TestGetSet::Test()                      ) goto failed; else PRINTF("-- TestGetSet passed\n");
 		if( TestOperator::Test()                    ) goto failed; else PRINTF("-- TestOperator passed\n");

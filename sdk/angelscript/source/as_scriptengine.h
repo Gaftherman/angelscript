@@ -313,6 +313,8 @@ public:
 	asCModule         *FindNewOwnerForSharedFunc(asCScriptFunction *func, asCModule *mod);
 
 	asCFuncdefType    *FindMatchingFuncdef(asCScriptFunction *func, asCModule *mod);
+	asCFuncdefType    *GetCanonicalFuncdef(const asCDataType &returnType, const asCArray<asCDataType> &parameterTypes, const asCArray<asETypeModifiers> &inOutFlags, asCModule *mod);
+	asCString          FormatCanonicalFuncdefName(const asCDataType &returnType, const asCArray<asCDataType> &parameterTypes, const asCArray<asETypeModifiers> &inOutFlags) const;
 
 	int                DetermineNameAndNamespace(const char *in_name, asSNameSpace *implicitNs, asCString &out_name, asSNameSpace *&out_ns) const;
 	asCTypeInfo       *GetTemplateSubTypeByName(const asCString &name);
@@ -418,6 +420,7 @@ public:
 	// TODO: redesign: Only shared funcdefs should be stored here
 	//                 a funcdef becomes shared if all arguments and the return type are shared (or application registered)
 	asCArray<asCFuncdefType *> funcDefs; // doesn't increases ref count
+	asCArray<asCFuncdefType *> canonicalFuncdefs; // doesn't increase ref count (elements are in funcDefs)
 
 	// Stores the names of the script sections for debugging purposes
 	asCArray<asCString *> scriptSectionNames;

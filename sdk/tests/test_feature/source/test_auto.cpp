@@ -254,8 +254,7 @@ bool Test()
 		engine->Release();
 	}
 
-	// Test that anonymous functions with auto generates proper error
-	// http://www.gamedev.net/topic/671632-auto-causes-crash-with-anonymous-functions/
+	// Test that anonymous functions with auto succeeds when parameters are typed (or parameterless)
 	{
 		const char *script =
 			"auto g_cb2 = function() {}; \n"
@@ -272,16 +271,45 @@ bool Test()
 		mod = engine->GetModule("Test", asGM_ALWAYS_CREATE);
 		mod->AddScriptSection("test", script);
 		r = mod->Build();
+		if (r < 0)
+			TEST_FAILED;
+
+		if (bout.buffer != "")
+		{
+			PRINTF("%s", bout.buffer.c_str());
+			TEST_FAILED;
+		}
+
+		engine->Release();
+	}
+
+	// Test that anonymous functions with auto without parameter types generates proper error
+	{
+		const char *script =
+			"auto g_cb2 = function(x) {}; \n"
+			"auto @g_cb3 = function(y) {}; \n"
+			"void test() { \n"
+			" auto cb2 = function(a) {}; \n"
+			" auto @cb3 = function(b) {}; \n"
+			"} \n";
+
+		engine = asCreateScriptEngine(ANGELSCRIPT_VERSION);
+		engine->SetMessageCallback(asMETHOD(CBufferedOutStream, Callback), &bout, asCALL_THISCALL);
+		bout.buffer = "";
+
+		mod = engine->GetModule("Test", asGM_ALWAYS_CREATE);
+		mod->AddScriptSection("test", script);
+		r = mod->Build();
 		if (r >= 0)
 			TEST_FAILED;
 
 		if (bout.buffer != "test (1, 6) : Info    : Compiling <auto> g_cb2\n"
-						   "test (1, 6) : Error   : Unable to resolve auto type\n"
+						   "test (1, 23) : Error   : Lambda parameters must have explicit types when using 'auto'\n"
 						   "test (2, 7) : Info    : Compiling <auto>@ g_cb3\n"
-						   "test (2, 7) : Error   : Unable to resolve auto type\n"
+						   "test (2, 24) : Error   : Lambda parameters must have explicit types when using 'auto'\n"
 						   "test (3, 1) : Info    : Compiling void test()\n"
-						   "test (4, 7) : Error   : Unable to resolve auto type\n"
-						   "test (5, 8) : Error   : Unable to resolve auto type\n")
+						   "test (4, 22) : Error   : Lambda parameters must have explicit types when using 'auto'\n"
+						   "test (5, 23) : Error   : Lambda parameters must have explicit types when using 'auto'\n")
 		{
 			PRINTF("%s", bout.buffer.c_str());
 			TEST_FAILED;

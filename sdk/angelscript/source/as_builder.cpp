@@ -1220,7 +1220,7 @@ int asCBuilder::VerifyProperty(asCDataType *dt, const char *decl, asCString &nam
 }
 
 #ifndef AS_NO_COMPILER
-asCObjectProperty *asCBuilder::GetObjectProperty(asCDataType &obj, const char *prop)
+asCObjectProperty *asCBuilder::GetObjectProperty(const asCDataType &obj, const char *prop)
 {
 	asASSERT(CastToObjectType(obj.GetTypeInfo()) != 0);
 
@@ -5221,7 +5221,93 @@ int asCBuilder::RegisterScriptFunctionFromNode(asCScriptNode *node, asCScriptCod
 	return RegisterScriptFunction(node, file, objType, isInterface, isGlobalFunction, ns, isExistingShared, isMixin, name, returnType, parameterNames, parameterTypes, inOutFlags, defaultArgs, funcTraits, decl);
 }
 
-asCScriptFunction *asCBuilder::RegisterLambda(asCScriptNode *node, asCScriptCode *file, asCScriptFunction *funcDef, const asCString &name, asSNameSpace *ns, bool isShared)
+asCObjectType *asCBuilder::SynthesizeClosureClass(const asCString &name, asSNameSpace *ns, bool isShared, asCScriptCode *file)
+{
+	asCObjectType *st = asNEW(asCObjectType)(engine);
+	if( st == 0 ) return 0;
+
+	st->flags = asOBJ_REF | asOBJ_SCRIPT_OBJECT | asOBJ_GC;
+	if( engine->ep.disableScriptClassGC )
+		st->flags &= ~asOBJ_GC;
+
+	if( isShared )
+		st->flags |= asOBJ_SHARED;
+
+	st->size = sizeof(asCScriptObject);
+	st->name = name;
+	st->nameSpace = ns ? ns : engine->nameSpaces[0];
+	st->module = module;
+	if( module )
+		module->AddClassType(st);
+	if( isShared )
+	{
+		engine->sharedScriptTypes.PushLast(st);
+		st->AddRefInternal();
+	}
+
+	// Use default script class behaviours
+	st->beh = engine->scriptTypeBehaviours.beh;
+
+	engine->scriptFunctions[st->beh.addref]->AddRefInternal();
+	engine->scriptFunctions[st->beh.release]->AddRefInternal();
+	engine->scriptFunctions[st->beh.gcEnumReferences]->AddRefInternal();
+	engine->scriptFunctions[st->beh.gcGetFlag]->AddRefInternal();
+	engine->scriptFunctions[st->beh.gcGetRefCount]->AddRefInternal();
+	engine->scriptFunctions[st->beh.gcReleaseAllReferences]->AddRefInternal();
+	engine->scriptFunctions[st->beh.gcSetFlag]->AddRefInternal();
+	engine->scriptFunctions[st->beh.copy]->AddRefInternal();
+	engine->scriptFunctions[st->beh.factory]->AddRefInternal();
+	engine->scriptFunctions[st->beh.construct]->AddRefInternal();
+	engine->scriptFunctions[st->beh.getWeakRefFlag]->AddRefInternal();
+
+	// Create and compile default constructor stub
+	int funcId = engine->GetNextScriptFunctionId();
+	asCDataType voidType = asCDataType::CreatePrimitive(ttVoid, false);
+	asCArray<asCDataType> parameterTypes;
+	asCArray<asCString> parameterNames;
+	asCArray<asETypeModifiers> inOutFlags;
+	asCArray<asCString*> defaultArgs;
+	if( module )
+		module->AddScriptFunction(file ? file->idx : 0, 0, funcId, st->name, voidType, parameterTypes, parameterNames, inOutFlags, defaultArgs, false, st, false, asSFunctionTraits(), st->nameSpace);
+	asCScriptFunction *ctor = engine->scriptFunctions[funcId];
+
+	if( st->beh.construct )
+		engine->scriptFunctions[st->beh.construct]->ReleaseInternal();
+	st->beh.construct = funcId;
+	st->beh.constructors[0] = funcId;
+	ctor->AddRefInternal();
+
+	asCCompiler ctorCompiler(engine);
+	ctorCompiler.Reset(this, file, ctor);
+	ctorCompiler.byteCode.InstrPTR(asBC_JitEntry, 0);
+	ctorCompiler.byteCode.Ret(AS_PTR_SIZE);
+	ctorCompiler.FinalizeFunction();
+
+	// Create and compile matching factory for bytecode serialization (asCWriter/asCReader assumes constructors and factories are 1:1)
+	int factoryId = engine->GetNextScriptFunctionId();
+	asCDataType handleType = asCDataType::CreateObjectHandle(st, false);
+	if( module )
+		module->AddScriptFunction(file ? file->idx : 0, 0, factoryId, st->name, handleType, parameterTypes, parameterNames, inOutFlags, defaultArgs, false, 0, false, asSFunctionTraits(), st->nameSpace);
+	asCScriptFunction *factory = engine->scriptFunctions[factoryId];
+	if( st->beh.factory )
+		engine->scriptFunctions[st->beh.factory]->ReleaseInternal();
+	st->beh.factory = factoryId;
+	st->beh.factories[0] = factoryId;
+	factory->AddRefInternal();
+
+	if( isShared )
+	{
+		ctor->SetShared(true);
+		factory->SetShared(true);
+	}
+
+	asCCompiler factoryCompiler(engine);
+	factoryCompiler.CompileFactory(this, file, factory);
+
+	return st;
+}
+
+asCScriptFunction *asCBuilder::RegisterLambda(asCScriptNode *node, asCScriptCode *file, asCScriptFunction *funcDef, const asCString &name, asSNameSpace *ns, bool isShared, asCObjectType *closureType, asCArray<asCString> *outerVars, bool outerHasThis)
 {
 	// Get the parameter names from the node
 	asCArray<asCString> parameterNames;
@@ -5251,12 +5337,20 @@ asCScriptFunction *asCBuilder::RegisterLambda(asCScriptNode *node, asCScriptCode
 	asCString funcName = name;
 	asSFunctionTraits traits;
 	traits.SetTrait(asTRAIT_SHARED, isShared);
-	int r = RegisterScriptFunction(args, file, 0, 0, true, ns, false, false, funcName, funcDef->returnType, parameterNames, funcDef->parameterTypes, funcDef->inOutFlags, defaultArgs, traits, 0);
+	if (closureType != 0)
+		traits.SetTrait(asTRAIT_LAMBDA, true);
+	int r = RegisterScriptFunction(args, file, closureType, 0, closureType == 0, ns, false, false, funcName, funcDef->returnType, parameterNames, funcDef->parameterTypes, funcDef->inOutFlags, defaultArgs, traits, 0);
 	if( r < 0 )
 		return 0;
 
 	// Return the function that was just created (but that will be compiled later)
-	return engine->scriptFunctions[functions[functions.GetLength()-1]->funcId];
+	asCScriptFunction *func = engine->scriptFunctions[functions[functions.GetLength()-1]->funcId];
+
+	if (outerVars)
+		func->outerVariableNames = *outerVars;
+	func->outerHasThis = outerHasThis;
+
+	return func;
 }
 
 int asCBuilder::RegisterScriptFunction(asCScriptNode *node, asCScriptCode *file, asCObjectType *objType, bool isInterface, bool isGlobalFunction, asSNameSpace *ns, bool isExistingShared, bool isMixin, asCString &name, asCDataType &returnType, asCArray<asCString> &parameterNames, asCArray<asCDataType> &parameterTypes, asCArray<asETypeModifiers> &inOutFlags, asCArray<asCString *> &defaultArgs, asSFunctionTraits funcTraits, sClassDeclaration* classDecl)
@@ -6484,12 +6578,74 @@ asCDataType asCBuilder::CreateDataTypeFromNode(asCScriptNode *node, asCScriptCod
 		asCString str;
 		str.Assign(&file->code[n->tokenPos], n->tokenLength);
 
-		// Recursively search parent namespaces for matching type
 		asSNameSpace *origNs = ns;
 		asCObjectType *origParentType = parentType;
-		asCArray<asSNameSpace*> pendingNamespaces;
-		asCArray<asSNameSpace*> visitedNamespaces;
-		bool checkAmbiguousSymbols = ns == engine->nameSpaces[0];
+
+		if (str == FUNCTION_TOKEN && n->next && n->next->nodeType == snFunctionType)
+		{
+			asCScriptNode *funcTypeNode = n->next;
+			asCScriptNode *retTypeNode = funcTypeNode->firstChild;
+			asCScriptNode *retModNode = retTypeNode->next;
+			asCScriptNode *paramListNode = retModNode->next;
+
+			// Parse return type
+			asCDataType returnType = CreateDataTypeFromNode(retTypeNode, file, implicitNamespace, true, currentType, reportError, isValid);
+			returnType = ModifyDataTypeFromNode(returnType, retModNode, file, 0, 0);
+
+			// Parse parameter types
+			asCArray<asCDataType> parameterTypes;
+			asCArray<asETypeModifiers> inOutFlags;
+			asCScriptNode *pNode = paramListNode->firstChild;
+			while (pNode)
+			{
+				if (pNode->nodeType == snVariadic)
+					break;
+
+				asETypeModifiers inOutFlag = asTM_NONE;
+				asCDataType paramType = CreateDataTypeFromNode(pNode, file, implicitNamespace, false, currentType, reportError, isValid);
+				paramType = ModifyDataTypeFromNode(paramType, pNode->next, file, &inOutFlag, 0);
+
+				if (paramType.GetTokenType() == ttVoid)
+				{
+					if (reportError)
+					{
+						asCString msg;
+						msg.Format(TXT_DATA_TYPE_CANT_BE_s, "void");
+						WriteError(msg, file, pNode);
+					}
+					if (isValid)
+						*isValid = false;
+					return asCDataType::CreatePrimitive(ttInt, false);
+				}
+
+				parameterTypes.PushLast(paramType);
+				inOutFlags.PushLast(inOutFlag);
+
+				pNode = pNode->next->next;
+				if (pNode && pNode->nodeType == snIdentifier)
+					pNode = pNode->next;
+				if (pNode && pNode->nodeType == snExpression)
+					pNode = pNode->next;
+			}
+
+			asCFuncdefType *funcDef = engine->GetCanonicalFuncdef(returnType, parameterTypes, inOutFlags, module);
+			if (funcDef == 0)
+			{
+				if (isValid)
+					*isValid = false;
+				return asCDataType::CreatePrimitive(ttInt, false);
+			}
+
+			dt = asCDataType::CreateType(funcDef, isConst);
+			found = true;
+			n = funcTypeNode;
+		}
+		else
+		{
+			// Recursively search parent namespaces for matching type
+			asCArray<asSNameSpace*> pendingNamespaces;
+			asCArray<asSNameSpace*> visitedNamespaces;
+			bool checkAmbiguousSymbols = ns == engine->nameSpaces[0];
 
 		if (scopeVisibleNamespaces)
 		{
@@ -6658,6 +6814,7 @@ asCDataType asCBuilder::CreateDataTypeFromNode(asCScriptNode *node, asCScriptCod
 				if (parentType)
 					parentType = 0;
 			}
+		}
 		}
 
 		if( !found )

@@ -1,0 +1,48 @@
+name: CI Test Suite
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  windows-msvc:
+    name: Windows x64 (MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S sdk/tests/test_feature/projects/cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build test_feature
+        run: |
+          cmake --build build --config Release
+
+      - name: Run test_feature
+        working-directory: sdk/tests/test_feature/bin
+        run: |
+          .\Release\test_feature.exe
+
+  linux-gcc:
+    name: Linux x64 (GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S sdk/tests/test_feature/projects/cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build test_feature
+        run: |
+          cmake --build build --config Release
+
+      - name: Run test_feature
+        working-directory: sdk/tests/test_feature/bin
+        run: |
+          ./test_feature

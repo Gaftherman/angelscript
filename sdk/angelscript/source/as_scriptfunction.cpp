@@ -375,6 +375,7 @@ asCScriptFunction::asCScriptFunction(asCScriptEngine *engine, asCModule *mod, as
 	funcForDelegate        = 0;
 	listPattern            = 0;
 	funcdefType            = 0;
+	outerHasThis           = false;
 
 	if( funcType == asFUNC_SCRIPT )
 		AllocateScriptFunctionData();
@@ -682,6 +683,9 @@ bool asCScriptFunction::DoesReturnOnStack() const
 // internal
 asCString asCScriptFunction::GetDeclarationStr(bool includeObjectName, bool includeNamespace, bool includeParamNames) const
 {
+	if( funcType == asFUNC_FUNCDEF && traits.GetTrait(asTRAIT_CANONICAL) )
+		return name;
+
 	asCString str;
 
 	// TODO: default arg: Make the declaration with the default args an option

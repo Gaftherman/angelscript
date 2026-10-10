@@ -373,6 +373,8 @@ protected:
 	int  SetupParametersAndReturnVariable(asCArray<asCString> &parameterNames, asCScriptNode *func);
 	int  InstantiateTemplateFunctions(asCArray<int>& funcs, asCScriptNode* node);
 	asCString BuildLambdaSignature(asCScriptNode* node);
+	asCDataType DeduceLambdaReturnType(asCScriptNode *funcNode, asCScriptCode *file, const asCArray<asCDataType> &paramTypes, const asCArray<asCString> &paramNames, const asCArray<asETypeModifiers> &inOutFlags, asCScriptFunction *enclosingFunc);
+	void GetOuterVariables(asCArray<asCString> &outerVars, bool &outerHasThis);
 
 	enum SYMBOLTYPE
 	{
@@ -441,6 +443,8 @@ protected:
 	bool                         m_isConstructor;
 	bool                         m_isConstructorCalled;
 	bool                         m_hasReturned;
+	bool                         m_isDeducingReturnType;
+	asCDataType                  m_deducedReturnType;
 	asCArray<asCObjectProperty*> m_initializedProperties; // Doesn't hold reference
 	asCArray<asSNameSpace*>      m_namespaceVisibility;
 	asCMap<asCObjectProperty*, asUINT> m_propertyAccessCount; // Doesn't hold reference
